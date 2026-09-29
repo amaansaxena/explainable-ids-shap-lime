@@ -221,7 +221,4 @@ data/raw/
 data/processed/
 models/
 .ipynb_checkpoints/
-data/preprocess/UNSW_NB15_train_preprocessed.csv
-data/preprocess/UNSW_NB15_test_preprocessed.csv
 
-.DS_Store
