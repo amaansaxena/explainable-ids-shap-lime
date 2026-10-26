@@ -207,7 +207,7 @@ BASE         = os.path.dirname(__file__)
 FEATURES     = ["flow_duration","fwd_packets","bwd_packets","fwd_bytes","bwd_bytes",
                 "fwd_to_bwd_pkt_ratio","fwd_to_bwd_byte_ratio","bytes_per_packet","packets_per_second"]
 FEATURE_LABELS = {
-    "flow_duration":        "Flow Duration (s)",
+    "flow_duration":        "Flow Duration",
     "fwd_packets":          "Fwd Packets",
     "bwd_packets":          "Bwd Packets",
     "fwd_bytes":            "Fwd Bytes",
@@ -216,12 +216,6 @@ FEATURE_LABELS = {
     "fwd_to_bwd_byte_ratio":"Fwd/Bwd Byte Ratio",
     "bytes_per_packet":     "Bytes per Packet",
     "packets_per_second":   "Packets per Second",
-}
-FEATURE_DEFAULTS = {
-    "flow_duration": 1.5, "fwd_packets": 10, "bwd_packets": 8,
-    "fwd_bytes": 1200, "bwd_bytes": 900,
-    "fwd_to_bwd_pkt_ratio": 1.25, "fwd_to_bwd_byte_ratio": 1.33,
-    "bytes_per_packet": 120.0, "packets_per_second": 12.0,
 }
 MODEL_COLORS = {"mlp_a":"#6366f1","mlp_b":"#8b5cf6","mlp_c":"#c084fc","rf":"#22c55e","dt":"#f59e0b"}
 EXP_COLORS   = {"A":"#22c55e","B":"#3b82f6","C":"#f59e0b","D":"#ef4444"}
@@ -309,64 +303,93 @@ def load_sidecar(dataset, model_name, seed):
             return json.load(f)
     return {}
 
+def _finalized_path(dataset):
+    name = "CICIDS" if dataset == "cicids" else "UNSW_NB15"
+    return os.path.join(BASE, "data", "preprocessed", "aligned", f"{name}_scaled.csv")
+
+@st.cache_data
+def load_split(dataset, split):
+    """Rows of the finalized (standardized, leakage-checked) data for one split.
+
+    Models were trained on these standardized values, so every input to the
+    Live Prediction page and every XAI background must come from this space.
+    """
+    path = _finalized_path(dataset)
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        df = df[df["split"] == split]
+    else:  # fall back to the committed aligned split if the pipeline has not been run
+        name = "CICIDS" if dataset == "cicids" else "UNSW_NB15"
+        df = pd.read_csv(os.path.join(BASE, "data", "preprocessed", "aligned", f"{name}_{split}_aligned.csv"))
+    return df[FEATURES + ["label"]].reset_index(drop=True)
+
+@st.cache_data
+def background_sample(dataset, n=200):
+    """Class-stratified background from the source training split."""
+    train = load_split(dataset, "train")
+    parts = [g.sample(min(len(g), n // 2), random_state=42) for _, g in train.groupby("label")]
+    return pd.concat(parts)[FEATURES].to_numpy(np.float32)
+
+def _attack_prob(model, model_name, X):
+    X = np.asarray(X, dtype=np.float32)
+    if model_name.startswith("mlp"):
+        return model.predict(X, verbose=0).reshape(-1)
+    return model.predict_proba(X)[:, 1]
+
+def _load(dataset, model_name, seed):
+    if model_name.startswith("mlp"):
+        return load_keras_model(dataset, model_name, seed)
+    return load_sklearn_model(dataset, model_name, seed)
+
 def predict(dataset, model_name, seed, x_arr):
-    """Return (attack_prob, label) for a single sample."""
+    """Return (attack_prob, label, threshold) for a single standardized sample."""
     try:
-        if model_name.startswith("mlp"):
-            model = load_keras_model(dataset, model_name, seed)
-            prob  = float(model.predict(x_arr, verbose=0)[0][0])
-        else:
-            model = load_sklearn_model(dataset, model_name, seed)
-            prob  = float(model.predict_proba(x_arr)[0][1])
+        model = _load(dataset, model_name, seed)
+        prob  = float(_attack_prob(model, model_name, x_arr)[0])
         sc    = load_sidecar(dataset, model_name, seed)
         thr   = sc.get("val_threshold", 0.5)
         label = int(prob >= thr)
         return prob, label, thr
-    except Exception as e:
+    except Exception:
         return None, None, None
 
+def _attack_slice(vals):
+    """Reduce any SHAP output layout to a (n_rows, n_features) attack-class array."""
+    if isinstance(vals, list):          # old SHAP: one array per class
+        vals = vals[-1]
+    vals = np.asarray(vals)
+    if vals.ndim == 3:                  # new SHAP: (rows, features, outputs)
+        vals = vals[:, :, -1]
+    return vals.reshape(vals.shape[0], -1)
+
 def shap_explanation(dataset, model_name, seed, x_arr):
-    """Return list of (feature, shap_val) pairs (may raise)."""
+    """Return list of (feature, shap_val) pairs for the attack class (may raise)."""
     import shap
+    model = _load(dataset, model_name, seed)
     if model_name.startswith("mlp"):
-        model = load_keras_model(dataset, model_name, seed)
-        explainer = shap.GradientExplainer(model, x_arr)
-        vals = explainer.shap_values(x_arr)
-        if isinstance(vals, list): vals = vals[0]
-        return list(zip(FEATURES, vals[0].tolist()))
+        # Background must be real training data; using the input itself makes every value 0.
+        explainer = shap.GradientExplainer(model, background_sample(dataset))
+        vals = explainer.shap_values(np.asarray(x_arr, dtype=np.float32))
     else:
-        model = load_sklearn_model(dataset, model_name, seed)
-        explainer = shap.TreeExplainer(model)
-        vals = explainer.shap_values(x_arr)
-        if isinstance(vals, list): vals = vals[1]
-        return list(zip(FEATURES, vals[0].tolist()))
+        vals = shap.TreeExplainer(model).shap_values(x_arr)
+    return list(zip(FEATURES, _attack_slice(vals)[0].tolist()))
 
 def lime_explanation(dataset, model_name, seed, x_arr):
-    """Return list of (feature, lime_val) pairs."""
+    """Return list of (feature, lime_weight) pairs for the attack class."""
     from lime import lime_tabular
-    import pandas as pd
-    # build a tiny background from aligned data
-    bg_path = os.path.join(BASE,"data","preprocessed","aligned",
-                           "CICIDS_train_aligned.csv" if dataset=="cicids" else "UNSW_NB15_train_aligned.csv")
-    if os.path.exists(bg_path):
-        bg = pd.read_csv(bg_path)[FEATURES].dropna().sample(min(200,1000), random_state=42).values
-    else:
-        bg = x_arr.repeat(50, axis=0)
-
-    if model_name.startswith("mlp"):
-        model = load_keras_model(dataset, model_name, seed)
-        def predict_fn(X): return np.column_stack([1-model.predict(X,verbose=0)[:,0], model.predict(X,verbose=0)[:,0]])
-    else:
-        model = load_sklearn_model(dataset, model_name, seed)
-        predict_fn = model.predict_proba
-
+    model = _load(dataset, model_name, seed)
+    def predict_fn(X):
+        p = _attack_prob(model, model_name, X)
+        return np.column_stack([1 - p, p])
     explainer = lime_tabular.LimeTabularExplainer(
-        bg, feature_names=FEATURES, class_names=["Normal","Attack"],
-        mode="classification", discretize_continuous=True, random_state=42
+        background_sample(dataset), feature_names=FEATURES, class_names=["Normal","Attack"],
+        mode="classification", discretize_continuous=False, random_state=42
     )
-    exp = explainer.explain_instance(x_arr[0], predict_fn, num_features=len(FEATURES), num_samples=500)
-    feat_map = dict(exp.as_list())
-    return [(f, feat_map.get(f, 0.0)) for f in FEATURES]
+    exp = explainer.explain_instance(np.asarray(x_arr[0], dtype=float), predict_fn,
+                                     num_features=len(FEATURES), num_samples=1000, labels=(1,))
+    # local_exp is keyed by feature index, so it works whatever the label text looks like.
+    weights = dict(exp.local_exp[1])
+    return [(f, float(weights.get(i, 0.0))) for i, f in enumerate(FEATURES)]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
@@ -482,7 +505,7 @@ if page == "Overview":
             fig.update_traces(textfont_size=12,textfont_color="#ffffff")
             fig = chart_layout(fig, height=340)
             fig.update_coloraxes(showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     with cr:
         section("Score Distribution")
@@ -492,7 +515,7 @@ if page == "Overview":
                          labels={"roc_auc":"ROC-AUC","experiment":"Experiment"})
         fig2 = chart_layout(fig2, height=340)
         fig2.update_layout(showlegend=False)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     section("Summary Table")
     smry = vd.groupby(["experiment","model"])[["roc_auc","f1","recall","precision"]]\
@@ -500,7 +523,7 @@ if page == "Overview":
     smry["experiment"] = smry["experiment"].map(EXP_LABELS).fillna(smry["experiment"])
     st.dataframe(smry.rename(columns={"experiment":"Experiment","model":"Model",
         "roc_auc":"ROC-AUC","f1":"F1","recall":"Recall","precision":"Precision"}),
-        use_container_width=True, hide_index=True)
+        width="stretch", hide_index=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — Model Performance
@@ -528,7 +551,7 @@ elif page == "Model Performance":
     fig.update_traces(textposition="outside",textfont_size=10,textfont_color="#f1f5f9",marker_line_width=0)
     fig = chart_layout(fig, height=420)
     fig.update_layout(legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     cl,cr = st.columns(2)
     with cl:
@@ -538,7 +561,7 @@ elif page == "Model Performance":
                       labels={chosen:chosen_label,"model":"Model"})
         fig2 = chart_layout(fig2, height=400)
         fig2.update_layout(showlegend=False)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     with cr:
         section("ROC-AUC vs Recall")
@@ -549,7 +572,7 @@ elif page == "Model Performance":
                           labels={"roc_auc":"ROC-AUC","recall":"Recall"})
         fig3.update_traces(marker_size=9)
         fig3 = chart_layout(fig3, height=400)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
 
     section("Multi-Metric Radar")
     radar_m = ["roc_auc","f1","recall","precision","balanced_accuracy"]
@@ -571,7 +594,7 @@ elif page == "Model Performance":
         legend=dict(bgcolor="rgba(15,23,42,.85)",bordercolor="rgba(99,102,241,.3)",borderwidth=1,
                     font=dict(color="#f1f5f9")),
     )
-    st.plotly_chart(fig4, use_container_width=True)
+    st.plotly_chart(fig4, width="stretch")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — XAI Attributions
@@ -606,7 +629,7 @@ elif page == "XAI Attributions":
                  text=agg["mean_abs_attribution"].round(4))
     fig.update_traces(textposition="outside",textfont_size=9,textfont_color="#f1f5f9",marker_line_width=0)
     fig = chart_layout(fig, height=440)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     section("Attribution Heatmap across Experiments")
     hm_meth = st.radio("Method for heatmap",["shap","lime"], horizontal=True, format_func=str.upper)
@@ -619,7 +642,7 @@ elif page == "XAI Attributions":
             text_auto=".4f", aspect="auto")
         fig2.update_traces(textfont_size=10,textfont_color="#ffffff")
         fig2 = chart_layout(fig2, height=400)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     section("SHAP vs LIME Agreement Scatter")
     cmp = xf[(xf["experiment"]==sel_exp_x)&(xf["model"]==sel_mod_x)]\
@@ -638,7 +661,7 @@ elif page == "XAI Attributions":
                        line=dict(color="rgba(99,102,241,.5)",dash="dash",width=1.5))
         fig3 = chart_layout(fig3, height=420)
         fig3.update_layout(showlegend=False)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — Reliability Analysis
@@ -665,7 +688,7 @@ elif page == "Reliability Analysis":
         fig.add_hline(y=0,line_dash="dash",line_color="rgba(239,68,68,.5)",line_width=1.5)
         fig = chart_layout(fig, height=400)
         fig.update_layout(legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     cl,cr = st.columns(2)
     with cl:
@@ -676,7 +699,7 @@ elif page == "Reliability Analysis":
         fig2.update_traces(marker_size=12,marker_line_width=1.5,marker_line_color="#f1f5f9")
         fig2.add_hline(y=.5,line_dash="dot",line_color="rgba(99,102,241,.5)")
         fig2 = chart_layout(fig2, height=360)
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     with cr:
         section("Top-5 Jaccard")
@@ -687,7 +710,7 @@ elif page == "Reliability Analysis":
         fig3.add_hline(y=.5,line_dash="dot",line_color="rgba(99,102,241,.5)")
         fig3 = chart_layout(fig3, height=360)
         fig3.update_layout(showlegend=False)
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
 
     section("In-Domain vs Cross-Domain Reliability")
     cross = rel[rel["comparison_type"].str.startswith("In_Domain_vs_Cross_Domain") &
@@ -701,10 +724,10 @@ elif page == "Reliability Analysis":
         fig4 = chart_layout(fig4, height=380)
         fig4.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1].replace("_"," "),
                                                      font=dict(size=10,color="#f1f5f9")))
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width="stretch")
 
     with st.expander("Raw Reliability Data"):
-        st.dataframe(rel, use_container_width=True, hide_index=True)
+        st.dataframe(rel, width="stretch", hide_index=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — Neuro-Symbolic
@@ -714,7 +737,8 @@ elif page == "Neuro-Symbolic":
     <div class="hero-header">
         <div class="hero-badge">Neuro-Symbolic AI</div>
         <h1 class="hero-title">Neuro-Symbolic Surrogate</h1>
-        <p class="hero-subtitle">Performance of the neuro-symbolic surrogate vs post-hoc SHAP/LIME.</p>
+        <p class="hero-subtitle">A depth-5 decision-tree surrogate fitted to MLP-A's decisions (global rule extraction).
+        Fidelity = share of test flows where the rules agree with the MLP they explain.</p>
     </div>""", unsafe_allow_html=True)
 
     ns  = load_neurosymbolic()
@@ -742,6 +766,10 @@ elif page == "Neuro-Symbolic":
                         <div style="font-size:1.2rem;font-weight:700;color:#f1f5f9;">{row['f1_score']:.3f}</div>
                         <div style="font-size:.7rem;color:#94a3b8;">F1</div>
                     </div>
+                    <div>
+                        <div style="font-size:1.2rem;font-weight:700;color:#f1f5f9;">{row.get('fidelity_test', float('nan')):.3f}</div>
+                        <div style="font-size:.7rem;color:#94a3b8;">Fidelity</div>
+                    </div>
                 </div>
             </div>""", unsafe_allow_html=True)
 
@@ -767,7 +795,7 @@ elif page == "Neuro-Symbolic":
             legend=dict(bgcolor="rgba(15,23,42,.85)",bordercolor="rgba(99,102,241,.3)",
                         borderwidth=1,font=dict(color="#f1f5f9")),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with cr:
         section("Surrogate vs Best Model (ROC-AUC)")
@@ -787,7 +815,7 @@ elif page == "Neuro-Symbolic":
             margin=dict(l=16,r=16,t=40,b=16),yaxis=dict(range=[0,1.12],gridcolor=GRID_COLOR),
             legend=dict(bgcolor="rgba(15,23,42,.85)",bordercolor="rgba(99,102,241,.3)",borderwidth=1,
                         font=dict(color="#f1f5f9")))
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     rules_path = os.path.join(BASE,"results","neurosymbolic_rules.txt")
     if os.path.exists(rules_path):
@@ -803,8 +831,8 @@ elif page == "Live Prediction":
         <div class="hero-badge">Live Inference</div>
         <h1 class="hero-title">Real-Time Traffic Prediction</h1>
         <p class="hero-subtitle">
-            Enter network flow features and get an instant attack/normal prediction
-            from any trained model — with SHAP or LIME explanations.
+            Pick a real flow from a held-out test set (or enter values) and get an
+            attack/normal prediction — with SHAP or LIME explanations.
         </p>
     </div>""", unsafe_allow_html=True)
 
@@ -823,26 +851,44 @@ elif page == "Live Prediction":
     st.markdown("<br>", unsafe_allow_html=True)
     section("Input Network Flow Features")
 
-    # ── Preset examples ────────────────────────────────────────────────────
-    col_preset, _ = st.columns([2,5])
-    with col_preset:
-        preset = st.selectbox("Load Preset", [
-            "— Manual Input —",
-            "Normal Web Browsing",
-            "Port Scan Attack",
-            "DDoS Flood",
+    # ── Input source ───────────────────────────────────────────────────────
+    # The models were trained on standardized (z-score) features and the original
+    # scaler was not preserved, so raw units (bytes, seconds, pkt/s) cannot be fed in.
+    # Inputs therefore come from real held-out test rows in the same standardized space.
+    src1, src2, src3 = st.columns([2,2,1])
+    with src1:
+        sample_kind = st.selectbox("Input", [
+            "Random attack flow (test set)",
+            "Random benign flow (test set)",
+            "Manual (standardized values)",
         ])
+    with src2:
+        sample_domain = st.selectbox("Draw flows from", ["cicids","unsw"],
+                                     index=0 if pred_dataset=="cicids" else 1,
+                                     format_func=lambda x:{"cicids":"CICIDS2017 test","unsw":"UNSW-NB15 test"}[x],
+                                     help="Pick the other dataset to try a cross-domain prediction.")
+    with src3:
+        st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+        if st.button("New sample", width="stretch"):
+            st.session_state["sample_draw"] = st.session_state.get("sample_draw", 0) + 1
+    draw = st.session_state.get("sample_draw", 0)
 
-    presets = {
-        "Normal Web Browsing":  [1.2,  12,  8,  1500,  900,  1.5,  1.67,  100,  15.0],
-        "Port Scan Attack":     [0.001, 1,  0,   60,    0,  0.0,   0.0,   60, 1000.0],
-        "DDoS Flood":           [0.01, 500,  0, 30000,   0,  0.0,   0.0,   60,50000.0],
-    }
-
-    if preset in presets:
-        defaults = presets[preset]
+    true_label = None
+    if sample_kind.startswith("Random"):
+        pool = load_split(sample_domain, "test")
+        want = 1 if "attack" in sample_kind else 0
+        cand = pool[pool["label"] == want]
+        row  = cand.sample(1, random_state=draw).iloc[0]
+        defaults   = [float(row[f]) for f in FEATURES]
+        true_label = int(row["label"])
+        input_key  = f"{sample_domain}_{want}_{draw}"
     else:
-        defaults = [FEATURE_DEFAULTS[f] for f in FEATURES]
+        defaults  = [0.0] * len(FEATURES)   # 0 = training-set mean for every feature
+        input_key = "manual"
+
+    st.caption("Values are standardized (z-scores): 0 is the training mean and ±1 is one "
+               "standard deviation. The original scaler was not preserved, so raw units "
+               "cannot be converted.")
 
     # ── Feature inputs ────────────────────────────────────────────────────
     feat_vals = {}
@@ -853,16 +899,16 @@ elif page == "Live Prediction":
             idx = FEATURES.index(feat)
             with col:
                 feat_vals[feat] = st.number_input(
-                    FEATURE_LABELS[feat],
+                    FEATURE_LABELS[feat] + " (z)",
                     value=float(defaults[idx]),
                     format="%.4f",
-                    key=f"inp_{feat}",
+                    key=f"inp_{feat}_{input_key}",
                 )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Run Prediction ────────────────────────────────────────────────────
-    if st.button("Run Prediction", type="primary", use_container_width=True):
+    if st.button("Run Prediction", type="primary", width="stretch"):
         x_arr = np.array([[feat_vals[f] for f in FEATURES]], dtype=np.float32)
 
         with st.spinner("Running model inference…"):
@@ -901,6 +947,9 @@ elif page == "Live Prediction":
 
             with r2:
                 st.metric("Attack Probability", f"{prob:.1%}")
+                if true_label is not None:
+                    verdict = "correct" if label == true_label else "wrong"
+                    st.caption(f"True label: **{'Attack' if true_label else 'Normal'}** — model is {verdict}")
             with r3:
                 st.metric("Decision Threshold", f"{threshold:.2f}")
 
@@ -928,7 +977,7 @@ elif page == "Live Prediction":
             gauge.update_layout(template="plotly_dark",paper_bgcolor=PAPER_BG,
                                  font=dict(family="Inter",color="#e2e8f0"),
                                  height=280,margin=dict(l=30,r=30,t=20,b=20))
-            st.plotly_chart(gauge, use_container_width=True)
+            st.plotly_chart(gauge, width="stretch")
 
             # ── All-model comparison ───────────────────────────────────────
             section("All Models — Quick Comparison")
@@ -945,10 +994,10 @@ elif page == "Live Prediction":
                                  text=rdf["Attack Prob"].apply(lambda v:f"{v:.1%}"))
                 fig_bar.update_traces(textposition="outside",textfont_size=12,textfont_color="#f1f5f9",marker_line_width=0)
                 fig_bar.add_hline(y=0.5,line_dash="dash",line_color="rgba(245,158,11,.6)",
-                                  annotation_text="0.5 threshold",annotation_font_color="#f1f5f9")
+                                  annotation_text="0.5 reference (labels use each model's own threshold)",annotation_font_color="#f1f5f9")
                 fig_bar = chart_layout(fig_bar, height=320)
                 fig_bar.update_layout(yaxis=dict(range=[0,1.15],tickformat=".0%"),showlegend=True)
-                st.plotly_chart(fig_bar, use_container_width=True)
+                st.plotly_chart(fig_bar, width="stretch")
 
             # ── XAI Explanation ────────────────────────────────────────────
             if xai_choice != "None":
@@ -987,7 +1036,7 @@ elif page == "Live Prediction":
                             yaxis_title="Feature",
                             barmode="overlay",
                         )
-                        st.plotly_chart(fig_xai, use_container_width=True)
+                        st.plotly_chart(fig_xai, width="stretch")
 
                         # legend
                         st.markdown("""
@@ -1001,7 +1050,7 @@ elif page == "Live Prediction":
                         with st.expander("Raw attribution values"):
                             st.dataframe(exp_df[["Feature","Attribution","Direction"]]
                                          .rename(columns={"Feature":"Feature","Attribution":"Attribution","Direction":"Direction"}),
-                                         use_container_width=True, hide_index=True)
+                                         width="stretch", hide_index=True)
                     except Exception as e:
                         st.warning(f"{xai_choice} explanation failed: {e}")
 
@@ -1018,7 +1067,7 @@ elif page == "Live Prediction":
             ["bytes_per_packet","Average bytes per packet across the flow"],
             ["packets_per_second","Average packet rate of the flow"],
         ], columns=["Feature","Description"])
-        st.dataframe(feat_info, use_container_width=True, hide_index=True)
+        st.dataframe(feat_info, width="stretch", hide_index=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — Visual Gallery
@@ -1050,7 +1099,7 @@ elif page == "Visual Gallery":
                 shown.add(fname)
                 label = fname.replace("figures/","").replace("_"," ").replace(".png","").title()
                 with cols[j]:
-                    st.image(fpath, caption=label, use_column_width=True)
+                    st.image(fpath, caption=label, width="stretch")
 
     remaining = {k:v for k,v in images.items() if k not in shown}
     if remaining:
@@ -1060,7 +1109,7 @@ elif page == "Visual Gallery":
             cols = st.columns(2)
             for j,(fname,fpath) in enumerate(img_list[i:i+2]):
                 with cols[j]:
-                    st.image(fpath, caption=fname.replace("_"," ").replace(".png","").title(), use_column_width=True)
+                    st.image(fpath, caption=fname.replace("_"," ").replace(".png","").title(), width="stretch")
 
     if not images:
         st.info("No PNG images found in `results/`. Run `python run_all.py` first.")

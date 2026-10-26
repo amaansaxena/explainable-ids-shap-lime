@@ -1,5 +1,5 @@
-experiment,source,target,model,roc_auc,precision,recall,f1_score,fpr
-A,cicids,cicids,neuro_symbolic_surrogate,0.9932,0.2706,0.995,0.4254,0.0442
-B,unsw,unsw,neuro_symbolic_surrogate,0.7904,0.6076,0.8763,0.7176,0.3536
-C,cicids,unsw,neuro_symbolic_surrogate,0.4588,0.5882,0.0017,0.0034,0.0007
-D,unsw,cicids,neuro_symbolic_surrogate,0.0914,0.0016,0.0875,0.0031,0.9042
+experiment,source,target,model,roc_auc,precision,recall,f1_score,fpr,fidelity_train,fidelity_test,fidelity_on_mlp_attacks,mlp_attack_rate_test,n_surrogate_leaves
+A,cicids,cicids,neuro_symbolic_surrogate,0.9888,0.6365,0.985,0.7733,0.0093,0.9982,0.9979,1.0,0.023,14
+B,unsw,unsw,neuro_symbolic_surrogate,0.7941,0.5593,0.938,0.7007,0.4618,0.9736,0.9283,0.9592,0.6242,30
+C,cicids,unsw,neuro_symbolic_surrogate,0.5343,0.4327,0.3595,0.3927,0.2945,0.9982,0.7175,0.5342,0.5411,14
+D,unsw,cicids,neuro_symbolic_surrogate,0.5045,0.0164,1.0,0.0322,0.9908,0.9736,0.2692,0.9859,0.2676,30

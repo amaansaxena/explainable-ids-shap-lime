@@ -3,7 +3,7 @@ numpy==2.5.0
 scikit-learn==1.9.1
 tensorflow==2.21.0
 shap==0.52.0
-lime==0.2.0
+lime==0.2.0.1
 matplotlib==3.11.2
 seaborn==0.13.2
 jupyter==1.1.1
@@ -13,3 +13,5 @@ scipy
 pyyaml
 tqdm
 pytest
+streamlit==1.66.0
+plotly==7.1.0

@@ -1,9 +1,9 @@
 experiment,comparison,spearman_rho,p_value,top3_jaccard
-A,NeuroSymbolic_vs_SHAP,0.6,0.0876,0.5
-A,NeuroSymbolic_vs_LIME,-0.4667,0.2054,0.0
-B,NeuroSymbolic_vs_SHAP,-0.3013,0.4308,0.0
-B,NeuroSymbolic_vs_LIME,0.3264,0.3914,0.2
-C,NeuroSymbolic_vs_SHAP,0.1826,0.6382,0.2
-C,NeuroSymbolic_vs_LIME,0.1826,0.6382,0.2
-D,NeuroSymbolic_vs_SHAP,0.5764,0.1043,0.5
-D,NeuroSymbolic_vs_LIME,0.4916,0.1789,0.2
+A,NeuroSymbolic_vs_SHAP,0.569,0.1098,0.5
+A,NeuroSymbolic_vs_LIME,-0.6193,0.0753,0.0
+B,NeuroSymbolic_vs_SHAP,-0.0333,0.9322,0.2
+B,NeuroSymbolic_vs_LIME,0.5167,0.1544,0.5
+C,NeuroSymbolic_vs_SHAP,-0.5255,0.1462,0.0
+C,NeuroSymbolic_vs_LIME,-0.3729,0.3229,0.0
+D,NeuroSymbolic_vs_SHAP,0.4951,0.1754,0.5
+D,NeuroSymbolic_vs_LIME,0.604,0.085,0.5

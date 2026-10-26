@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 import numpy as np
@@ -26,8 +27,25 @@ LOGGER = logging.getLogger(__name__)
 
 
 def extract_rules(surrogate: DecisionTreeClassifier, feature_names: list[str]) -> str:
-    """Export human-readable IF-THEN decision rules from the tree."""
-    return export_text(surrogate, feature_names=feature_names, max_depth=4)
+    """Export the full IF-THEN rule set (all levels of the tree, nothing truncated)."""
+    return export_text(surrogate, feature_names=feature_names, max_depth=surrogate.get_depth())
+
+
+def black_box_threshold(model_path: Path) -> float:
+    """Validation-tuned decision threshold saved next to the model (falls back to 0.5)."""
+    sidecar = model_path.with_suffix(".json")
+    if sidecar.exists():
+        return float(json.loads(sidecar.read_text(encoding="utf-8")).get("val_threshold", 0.5))
+    return 0.5
+
+
+def explained_indices(experiment: str, n_rows: int) -> np.ndarray:
+    """Same class-balanced test rows that SHAP/LIME explained, so the comparison is like-for-like."""
+    path = config.RESULTS_DIR / "xai" / f"instances_{experiment}.json"
+    if path.exists():
+        return np.asarray(json.loads(path.read_text(encoding="utf-8"))["indices"], dtype=int)
+    LOGGER.warning("%s missing; falling back to the first 1000 test rows", path)
+    return np.arange(min(1000, n_rows))
 
 
 def main() -> None:
@@ -38,6 +56,7 @@ def main() -> None:
 
     # 1. Train surrogates on Source datasets (CICIDS and UNSW) for best neural model mlp_a
     surrogates = {}
+    black_boxes = {}
     for source in ["cicids", "unsw"]:
         X_train, y_train = load_dataset(source, "train")
         model_path = config.MODELS_DIR / source / "mlp_a" / "seed42.keras"
@@ -45,14 +64,18 @@ def main() -> None:
             LOGGER.warning("Missing %s, skipping", model_path)
             continue
         adapter = ModelAdapter.load(model_path, name="mlp_a")
-        preds = adapter.predict(X_train.to_numpy(float))
-        
-        # Fit surrogate tree on black-box predictions
+        threshold = black_box_threshold(model_path)
+        preds = adapter.predict(X_train.to_numpy(float), threshold=threshold)
+
+        # Fit surrogate tree on the black box's own decisions (not the true labels)
         surrogate = fit_surrogate(X_train.to_numpy(float), preds, max_depth=5, seed=42)
         surrogates[source] = surrogate
+        black_boxes[source] = (adapter, threshold, float((surrogate.predict(X_train.to_numpy(float)) == preds).mean()))
 
         # Document human-readable rule trace
         rules_text.append(f"==================== NEURO-SYMBOLIC RULES (Source: {source.upper()}) ====================\n")
+        rules_text.append(f"# Surrogate of mlp_a seed42 at threshold {threshold:.2f}; train fidelity {black_boxes[source][2]:.4f}\n")
+        rules_text.append("# Thresholds are standardized (z-score) values; raw units cannot be recovered (scaler not preserved).\n")
         rules_text.append(extract_rules(surrogate, config.FEATURES))
         rules_text.append("\n\n")
 
@@ -69,6 +92,13 @@ def main() -> None:
         probs = surrogate.predict_proba(values)[:, 1]
         preds = (probs >= 0.5).astype(int)
 
+        # Fidelity: how often the surrogate agrees with the MLP it is meant to explain
+        adapter, bb_threshold, train_fidelity = black_boxes[source]
+        bb_preds = adapter.predict(values, threshold=bb_threshold)
+        test_fidelity = float((preds == bb_preds).mean())
+        attack_mask = bb_preds == 1
+        attack_fidelity = float((preds[attack_mask] == 1).mean()) if attack_mask.any() else float("nan")
+
         auc = roc_auc_score(labels, probs) if len(np.unique(labels)) > 1 else 0.5
         p, r, f1, _ = precision_recall_fscore_support(labels, preds, average="binary", zero_division=0)
         cm = confusion_matrix(labels, preds)
@@ -84,10 +114,15 @@ def main() -> None:
             "recall": round(r, 4),
             "f1_score": round(f1, 4),
             "fpr": round(fpr, 4),
+            "fidelity_train": round(train_fidelity, 4),
+            "fidelity_test": round(test_fidelity, 4),
+            "fidelity_on_mlp_attacks": round(attack_fidelity, 4),
+            "mlp_attack_rate_test": round(float(attack_mask.mean()), 4),
+            "n_surrogate_leaves": int(surrogate.get_n_leaves()),
         })
 
         # 3. Rule path attributions for the configuration
-        path_attrs = rule_path_attribution(surrogate, values[:200])  # Sample 200 test rows
+        path_attrs = rule_path_attribution(surrogate, values[explained_indices(exp, len(values))])
         mean_attrs = np.mean(path_attrs, axis=0)
         for feat_idx, feat in enumerate(config.FEATURES):
             rule_attributions.append({
