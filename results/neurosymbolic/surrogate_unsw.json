@@ -1,0 +1,7 @@
+{
+  "black_box": "mlp_a",
+  "seed": 42,
+  "black_box_threshold": 0.30000000000000004,
+  "fidelity_train": 0.9736,
+  "max_depth": 5
+}

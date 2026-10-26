@@ -5,14 +5,20 @@ This repository evaluates binary intrusion-detection models on aligned CICIDS201
 ## Setup
 1. `git lfs pull` (the aligned CSVs are stored with Git LFS)
 2. `python -m pip install -r requirements.txt`
-3. Run the smoke pipeline: `python run_all.py --smoke`
-4. Run the full pipeline: `python run_all.py`
-5. Run the neuro-symbolic surrogate (needs `results/xai_summary.csv` from step 4): `python -m src.evaluate_neurosymbolic`
+3. Run the smoke pipeline: `python run_all.py --smoke` (writes to `smoke_output/`, so the committed models and results are left alone)
+4. Run the full pipeline: `python run_all.py` (retrains every model and overwrites `models/` and `results/`)
+5. Run the neuro-symbolic surrogate (needs `results/xai_summary.csv` from step 4): `python -m src.evaluate_neurosymbolic`.
+   This also saves the fitted rule trees to `results/neurosymbolic/`, which the dashboard's Live Prediction page uses.
 6. Regenerate figures: `python -m src.visualize_results`
 7. Launch the dashboard: `streamlit run app.py`
 
 The dashboard's Live Prediction page uses real held-out test flows in standardized (z-score) units,
 because the models were trained on standardized features and the original scaler was not preserved.
+Besides SHAP and LIME it can show a Neuro-Symbolic explanation: the IF-THEN rule the surrogate tree of
+MLP-A (seed 42) applies to the flow, whether it agrees with MLP-A, and the rules' test fidelity.
+If the data CSVs are missing or are un-pulled Git LFS pointers, the page falls back to manual input.
+
+`requirements.txt` pins the versions the dashboard and pipeline were tested with (Python 3.13).
 
 ## Datasets
 - CICIDS2017

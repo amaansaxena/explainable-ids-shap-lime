@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.tree import DecisionTreeClassifier, export_text
@@ -135,6 +136,18 @@ def main() -> None:
     # Save outputs
     res_dir = config.RESULTS_DIR
     res_dir.mkdir(exist_ok=True)
+
+    # Fitted trees, so the dashboard explains live flows with exactly these rules
+    surrogate_dir = res_dir / "neurosymbolic"
+    surrogate_dir.mkdir(exist_ok=True)
+    for source, surrogate in surrogates.items():
+        joblib.dump(surrogate, surrogate_dir / f"surrogate_{source}.joblib")
+        _, bb_threshold, train_fidelity = black_boxes[source]
+        (surrogate_dir / f"surrogate_{source}.json").write_text(json.dumps({
+            "black_box": "mlp_a", "seed": 42, "black_box_threshold": bb_threshold,
+            "fidelity_train": round(train_fidelity, 4), "max_depth": surrogate.get_depth(),
+        }, indent=2), encoding="utf-8")
+    LOGGER.info("Saved surrogate trees to %s", surrogate_dir)
 
     perf_df = pd.DataFrame(records_perf)
     perf_df.to_csv(res_dir / "neurosymbolic_metrics.csv", index=False)

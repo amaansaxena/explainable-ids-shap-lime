@@ -78,6 +78,7 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 results/xai_cache/
+smoke_output/
 
 # IPython
 profile_default/

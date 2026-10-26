@@ -4,6 +4,7 @@ Beautiful Streamlit web application for IDS model performance and XAI explanatio
 """
 
 import os
+import sys
 import json
 import warnings
 import numpy as np
@@ -203,7 +204,9 @@ pre { background: rgba(15,23,42,.8) !important; }
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & helpers
 # ─────────────────────────────────────────────────────────────────────────────
-BASE         = os.path.dirname(__file__)
+BASE         = os.path.dirname(os.path.abspath(__file__))
+if BASE not in sys.path:  # so `src` imports work whatever directory streamlit is launched from
+    sys.path.insert(0, BASE)
 FEATURES     = ["flow_duration","fwd_packets","bwd_packets","fwd_bytes","bwd_bytes",
                 "fwd_to_bwd_pkt_ratio","fwd_to_bwd_byte_ratio","bytes_per_packet","packets_per_second"]
 FEATURE_LABELS = {
@@ -307,26 +310,62 @@ def _finalized_path(dataset):
     name = "CICIDS" if dataset == "cicids" else "UNSW_NB15"
     return os.path.join(BASE, "data", "preprocessed", "aligned", f"{name}_scaled.csv")
 
+class DataUnavailable(RuntimeError):
+    """Flow CSVs are missing, unreadable, or un-pulled Git LFS pointer files."""
+
+def _read_flows(path):
+    rel = os.path.relpath(path, BASE)
+    if not os.path.exists(path):
+        raise DataUnavailable(f"`{rel}` not found.")
+    with open(path, "rb") as f:
+        if f.read(40).startswith(b"version https://git-lfs"):
+            raise DataUnavailable(f"`{rel}` is a Git LFS pointer, not data. Run `git lfs pull`.")
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        raise DataUnavailable(f"`{rel}` could not be read: {e}") from e
+    missing = [c for c in FEATURES + ["label"] if c not in df.columns]
+    if missing:
+        raise DataUnavailable(f"`{rel}` is missing columns: {', '.join(missing)}")
+    return df
+
 @st.cache_data
 def load_split(dataset, split):
     """Rows of the finalized (standardized, leakage-checked) data for one split.
 
     Models were trained on these standardized values, so every input to the
     Live Prediction page and every XAI background must come from this space.
+    Raises DataUnavailable if no readable data exists.
     """
     path = _finalized_path(dataset)
     if os.path.exists(path):
-        df = pd.read_csv(path)
+        df = _read_flows(path)
         df = df[df["split"] == split]
     else:  # fall back to the committed aligned split if the pipeline has not been run
         name = "CICIDS" if dataset == "cicids" else "UNSW_NB15"
-        df = pd.read_csv(os.path.join(BASE, "data", "preprocessed", "aligned", f"{name}_{split}_aligned.csv"))
+        df = _read_flows(os.path.join(BASE, "data", "preprocessed", "aligned", f"{name}_{split}_aligned.csv"))
     return df[FEATURES + ["label"]].reset_index(drop=True)
+
+def data_problem(dataset, split="train"):
+    """Why a split cannot be loaded, or None if it loads fine."""
+    try:
+        load_split(dataset, split)
+        return None
+    except DataUnavailable as e:
+        return str(e)
 
 @st.cache_data
 def background_sample(dataset, n=200):
-    """Class-stratified background from the source training split."""
-    train = load_split(dataset, "train")
+    """Class-stratified background from the source training split.
+
+    If the data cannot be loaded, fall back to standard-normal noise: the features
+    are z-scored on the training split (mean 0, std 1), so this approximates the
+    training distribution. Using copies of the input instead would zero out SHAP.
+    """
+    try:
+        train = load_split(dataset, "train")
+    except DataUnavailable:
+        return np.random.default_rng(42).standard_normal((n, len(FEATURES))).astype(np.float32)
     parts = [g.sample(min(len(g), n // 2), random_state=42) for _, g in train.groupby("label")]
     return pd.concat(parts)[FEATURES].to_numpy(np.float32)
 
@@ -391,6 +430,42 @@ def lime_explanation(dataset, model_name, seed, x_arr):
     weights = dict(exp.local_exp[1])
     return [(f, float(weights.get(i, 0.0))) for i, f in enumerate(FEATURES)]
 
+@st.cache_resource
+def load_surrogate(source):
+    """Decision-tree surrogate of mlp_a seed42 saved by src.evaluate_neurosymbolic (or None)."""
+    import joblib
+    path = os.path.join(BASE, "results", "neurosymbolic", f"surrogate_{source}.joblib")
+    return joblib.load(path) if os.path.exists(path) else None
+
+def surrogate_rule(tree, x_arr):
+    """The IF-THEN conditions this flow satisfies on its path through the surrogate tree."""
+    t = tree.tree_
+    path = tree.decision_path(x_arr).indices
+    conds = []
+    for node, nxt in zip(path[:-1], path[1:]):
+        # Direction comes from the child actually taken, so it always matches the tree's own routing.
+        op = "≤" if nxt == t.children_left[node] else ">"
+        f = t.feature[node]
+        conds.append((FEATURES[f], op, float(t.threshold[node]), float(x_arr[0, f])))
+    return conds, int(t.n_node_samples[path[-1]])
+
+def neurosymbolic_explanation(source, target, x_arr):
+    """Surrogate verdict, fired rule, path attributions and fidelity for one flow (None if no surrogate)."""
+    from src.xai.neurosymbolic import rule_path_attribution
+    tree = load_surrogate(source)
+    if tree is None:
+        return None
+    x = np.asarray(x_arr, dtype=np.float32)
+    prob = float(tree.predict_proba(x)[0, 1])
+    conds, leaf_samples = surrogate_rule(tree, x)
+    attrs = rule_path_attribution(tree, x)[0]
+    ns = load_neurosymbolic()
+    row = ns[(ns["source"] == source) & (ns["target"] == target)]
+    fidelity = float(row["fidelity_test"].iloc[0]) if len(row) and "fidelity_test" in row else None
+    return {"prob": prob, "label": int(prob >= 0.5), "conditions": conds, "leaf_samples": leaf_samples,
+            "attributions": list(zip(FEATURES, attrs)), "fidelity": fidelity,
+            "experiment": row["experiment"].iloc[0] if len(row) else None}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,6 +517,11 @@ def filt(df, threshold=True):
     if threshold and "threshold_type" in df.columns:
         m &= (df["threshold_type"] == thr_type)
     return df[m]
+
+# Pages driven by the sidebar filters show nothing useful with an empty selection.
+if page not in ("Live Prediction", "Visual Gallery") and (not sel_exp or not sel_models):
+    st.warning("Select at least one experiment and one model in the sidebar filters.")
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE — Overview
@@ -846,7 +926,9 @@ elif page == "Live Prediction":
     with cfg3:
         pred_seed = st.selectbox("Seed",[42,43,44,45,46])
     with cfg4:
-        xai_choice = st.selectbox("XAI Explanation",["None","SHAP","LIME"])
+        xai_choice = st.selectbox("XAI Explanation",["None","SHAP","LIME","Neuro-Symbolic"],
+                                  help="Neuro-Symbolic shows the IF-THEN rule a decision-tree surrogate "
+                                       "of MLP-A (seed 42) applies to this flow.")
 
     st.markdown("<br>", unsafe_allow_html=True)
     section("Input Network Flow Features")
@@ -874,6 +956,13 @@ elif page == "Live Prediction":
     draw = st.session_state.get("sample_draw", 0)
 
     true_label = None
+    pool_problem = data_problem(sample_domain, "test") if sample_kind.startswith("Random") else None
+    if pool_problem:
+        st.error(f"Can't draw test flows: {pool_problem} Falling back to manual input.")
+        sample_kind = "Manual (standardized values)"
+    if data_problem(pred_dataset) and xai_choice in ("SHAP", "LIME"):
+        st.caption(f"Training data for {pred_dataset.upper()} is unavailable, so {xai_choice} uses a "
+                   "synthetic standard-normal background. Explanations are approximate.")
     if sample_kind.startswith("Random"):
         pool = load_split(sample_domain, "test")
         want = 1 if "attack" in sample_kind else 0
@@ -999,8 +1088,80 @@ elif page == "Live Prediction":
                 fig_bar.update_layout(yaxis=dict(range=[0,1.15],tickformat=".0%"),showlegend=True)
                 st.plotly_chart(fig_bar, width="stretch")
 
+            # ── Neuro-Symbolic Explanation ─────────────────────────────────
+            if xai_choice == "Neuro-Symbolic":
+                section("Neuro-Symbolic Rule Explanation")
+                target = sample_domain if true_label is not None else pred_dataset
+                ns_exp = neurosymbolic_explanation(pred_dataset, target, x_arr)
+                if ns_exp is None:
+                    st.warning("No saved surrogate tree found. Run `python -m src.evaluate_neurosymbolic` "
+                               "to create `results/neurosymbolic/`.")
+                else:
+                    mlp_prob, mlp_label, _ = predict(pred_dataset, "mlp_a", 42, x_arr)
+                    n1, n2, n3 = st.columns(3)
+                    with n1:
+                        st.metric("Rule Verdict", "Attack" if ns_exp["label"] else "Normal",
+                                  f"leaf attack share {ns_exp['prob']:.0%}", delta_color="off")
+                    with n2:
+                        if mlp_label is None:
+                            st.metric("Agrees with MLP-A?", "—")
+                        else:
+                            st.metric("Agrees with MLP-A?", "Yes" if mlp_label == ns_exp["label"] else "No",
+                                      f"MLP-A says {'Attack' if mlp_label else 'Normal'} ({mlp_prob:.0%})",
+                                      delta_color="off")
+                    with n3:
+                        fid = ns_exp["fidelity"]
+                        st.metric("Rule Fidelity (test)", f"{fid:.1%}" if fid is not None else "—",
+                                  f"Exp {ns_exp['experiment']}" if ns_exp["experiment"] else None,
+                                  delta_color="off")
+                    if ns_exp["fidelity"] is not None and ns_exp["fidelity"] < 0.8:
+                        st.warning(f"On {target.upper()} test flows these rules agree with MLP-A only "
+                                   f"{ns_exp['fidelity']:.0%} of the time, so this rule is a weak "
+                                   "description of what the network does here.")
+                    if (pred_model, pred_seed) != ("mlp_a", 42):
+                        st.caption(f"The surrogate imitates MLP-A seed 42 trained on {pred_dataset.upper()}, "
+                                   f"not the selected {pred_model.upper()} seed {pred_seed}.")
+
+                    # Merge repeated splits on one feature into a single range (same logic, easier to read)
+                    bounds = {}
+                    for f, op, thr, v in ns_exp["conditions"]:
+                        lo, hi, _ = bounds.get(f, (None, None, v))
+                        if op == ">":
+                            lo = thr if lo is None else max(lo, thr)
+                        else:
+                            hi = thr if hi is None else min(hi, thr)
+                        bounds[f] = (lo, hi, v)
+                    conds = []
+                    for f, (lo, hi, v) in bounds.items():
+                        name = f"{FEATURE_LABELS[f]} (z)"
+                        if lo is not None and hi is not None:
+                            cond = f"{lo:+.4f} < {name} ≤ {hi:+.4f}"
+                        elif lo is not None:
+                            cond = f"{name} > {lo:+.4f}"
+                        else:
+                            cond = f"{name} ≤ {hi:+.4f}"
+                        conds.append(f"{cond}    [this flow: {v:+.4f}]")
+                    lines = ["IF"] + [f"   {'AND ' if i else '    '}{c}" for i, c in enumerate(conds)] \
+                          + [f"THEN {'Attack' if ns_exp['label'] else 'Normal'}"
+                         f"    ({ns_exp['leaf_samples']:,} training flows reach this leaf)"]
+                    st.code("\n".join(lines), language="text")
+
+                    attr_df = pd.DataFrame(ns_exp["attributions"], columns=["Feature","Importance"])
+                    attr_df = attr_df[attr_df["Importance"] > 0].sort_values("Importance")
+                    if not attr_df.empty:
+                        fig_ns = px.bar(attr_df, x="Importance",
+                                        y=attr_df["Feature"].map(FEATURE_LABELS), orientation="h",
+                                        text=attr_df["Importance"].round(4),
+                                        labels={"y":"Feature","Importance":"Split importance on this path"})
+                        fig_ns.update_traces(marker_color="#8b5cf6", textposition="outside",
+                                             textfont=dict(color="#f1f5f9",size=10))
+                        fig_ns = chart_layout(fig_ns, height=300)
+                        st.plotly_chart(fig_ns, width="stretch")
+                        st.caption("Features the rule tests, weighted by how much each split reduces "
+                                   "impurity across the whole tree. Unused features score 0.")
+
             # ── XAI Explanation ────────────────────────────────────────────
-            if xai_choice != "None":
+            elif xai_choice != "None":
                 section(f"{xai_choice} Feature Explanation")
                 with st.spinner(f"Computing {xai_choice} explanation…"):
                     try:

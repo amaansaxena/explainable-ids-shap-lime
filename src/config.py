@@ -1,13 +1,16 @@
 """Single source of truth for the IDS pipeline configuration."""
 
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 ALIGNED_DIR = DATA_DIR / "preprocessed" / "aligned"
-MODELS_DIR = ROOT / "models"
+# IDS_OUTPUT_DIR redirects models and results (run_all.py --smoke uses it so test runs never overwrite real outputs).
+OUTPUT_ROOT = Path(os.environ["IDS_OUTPUT_DIR"]).resolve() if os.environ.get("IDS_OUTPUT_DIR") else ROOT
+MODELS_DIR = OUTPUT_ROOT / "models"
 SCALERS_DIR = MODELS_DIR / "scalers"
-RESULTS_DIR = ROOT / "results"
+RESULTS_DIR = OUTPUT_ROOT / "results"
 XAI_CACHE_DIR = RESULTS_DIR / "xai_cache"
 DATASETS = ("cicids", "unsw")
 FEATURES = ["flow_duration", "fwd_packets", "bwd_packets", "fwd_bytes", "bwd_bytes", "fwd_to_bwd_pkt_ratio", "fwd_to_bwd_byte_ratio", "bytes_per_packet", "packets_per_second"]
