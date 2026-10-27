@@ -59,4 +59,4 @@ class-balanced instances that SHAP/LIME explain, so the comparison is like-for-l
 
 ## Results
 
-Generated outputs are written under `results/`. Numeric interpretation is intentionally left to the report author.
+Generated outputs are written under `results/`.
